@@ -143,6 +143,18 @@ import {
   type ExchangeModule,
 } from "./modules/exchange/index.js";
 
+// Resolve a deployment-relative path against the likely runtime working directories.
+// Vercel serverless functions may run with a working directory that differs from the
+// project root, so we probe a few candidate bases and return the first that exists.
+function resolveDeployPath(relativePath: string): string {
+  const bases = [process.cwd(), resolve(process.cwd(), "apps/workspace")];
+  for (const base of bases) {
+    const candidate = resolve(base, relativePath);
+    if (existsSync(candidate)) return candidate;
+  }
+  return resolve(process.cwd(), relativePath);
+}
+
 export interface WorkspaceApplication {
   readonly app: express.Express;
   readonly identity: IdentityModule;
@@ -430,7 +442,7 @@ export function createWorkspaceApplication(
     });
   }
   app.get("/openapi.yaml", (_request, response) => {
-    const filename = resolve(process.cwd(), process.env.WORKSPACE_GENERATED_DIR ?? "generated", "http/openapi.bundled.yaml");
+    const filename = resolveDeployPath(`${process.env.WORKSPACE_GENERATED_DIR ?? "generated"}/http/openapi.bundled.yaml`);
     if (!existsSync(filename)) {
       response
         .status(503)
@@ -525,7 +537,7 @@ export function createWorkspaceApplication(
   app.use(createStandaloneAppRouter({ identity, access, blobs }));
   app.use("/api", notFoundHandler);
 
-  const publicDirectory = resolve(process.cwd(), process.env.WORKSPACE_PUBLIC_DIR ?? "dist/public");
+  const publicDirectory = resolveDeployPath(process.env.WORKSPACE_PUBLIC_DIR ?? "dist/public");
   if (existsSync(publicDirectory)) {
     app.use(createStaticSiteRouter(publicDirectory, { nodes, identity, permissions, publicOrigin: config.publicOrigin }));
   }
