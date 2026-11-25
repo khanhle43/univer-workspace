@@ -14,18 +14,64 @@ import { pathToFileURL } from "node:url";
 const preloadedEsmByPath = new Map();
 let esmSupportInstalled = false;
 
-function installRequireEsmExtensions() {
+function compileModuleInstanceAsEsm(mod, filename) {
+  mod.filename = filename;
+  mod.paths = Module._nodeModulePaths(dirname(filename));
+  if (preloadedEsmByPath.has(filename)) {
+    mod.exports = preloadedEsmByPath.get(filename);
+  } else {
+    const source = readFileSync(filename, "utf8");
+    mod._compile(source, filename, "module");
+  }
+  mod.loaded = true;
+}
+
+function installRequireEsmHooks() {
   if (esmSupportInstalled) return;
   esmSupportInstalled = true;
 
-  const compileAsEsm = (mod, filename) => {
-    if (preloadedEsmByPath.has(filename)) {
-      mod.exports = preloadedEsmByPath.get(filename);
-      return;
-    }
-    const source = readFileSync(filename, "utf8");
-    return mod._compile(source, filename, "module");
-  };
+  // Vercel's Rust Node launcher (/opt/rust/nodejs.js) overrides Module.prototype.load
+  // and throws ERR_REQUIRE_ESM before reaching Module._extensions[".js"], even on
+  // Node 24/26 where native require(esm) is built into Module.prototype._compile.
+  const prevProtoLoad = Module.prototype.load;
+  if (typeof prevProtoLoad === "function") {
+    Module.prototype.load = function patchedProtoLoad(filename) {
+      try {
+        return prevProtoLoad.call(this, filename);
+      } catch (err) {
+        if (err && err.code === "ERR_REQUIRE_ESM") {
+          compileModuleInstanceAsEsm(this, filename);
+          return;
+        }
+        throw err;
+      }
+    };
+  }
+
+  const prevStaticLoad = Module._load;
+  if (typeof prevStaticLoad === "function") {
+    Module._load = function patchedStaticLoad(request, parent, isMain) {
+      try {
+        return prevStaticLoad.call(this, request, parent, isMain);
+      } catch (err) {
+        if (err && err.code === "ERR_REQUIRE_ESM") {
+          const filename = Module._resolveFilename(request, parent, isMain);
+          const cached = Module._cache[filename];
+          if (cached && cached.loaded) return cached.exports;
+          const mod = cached || new Module(filename, parent);
+          Module._cache[filename] = mod;
+          try {
+            compileModuleInstanceAsEsm(mod, filename);
+            return mod.exports;
+          } catch (compileErr) {
+            delete Module._cache[filename];
+            throw compileErr;
+          }
+        }
+        throw err;
+      }
+    };
+  }
 
   const prevJs = Module._extensions[".js"];
   if (typeof prevJs === "function") {
@@ -34,7 +80,8 @@ function installRequireEsmExtensions() {
         return prevJs.call(this, mod, filename);
       } catch (err) {
         if (err && err.code === "ERR_REQUIRE_ESM") {
-          return compileAsEsm(mod, filename);
+          compileModuleInstanceAsEsm(mod, filename);
+          return;
         }
         throw err;
       }
@@ -50,7 +97,7 @@ function installRequireEsmExtensions() {
         if (!err || err.code !== "ERR_REQUIRE_ESM") throw err;
       }
     }
-    return compileAsEsm(mod, filename);
+    compileModuleInstanceAsEsm(mod, filename);
   };
 }
 
@@ -114,7 +161,7 @@ async function preloadPnpmEsmPackagesFallback() {
 }
 
 async function ensureRequireEsmSupport() {
-  installRequireEsmExtensions();
+  installRequireEsmHooks();
   if (!supportsSyncCompileModule()) {
     await preloadPnpmEsmPackagesFallback();
   }
