@@ -8,6 +8,7 @@ import { createStandaloneAppRouter } from "./modules/views/standalone-app.router
 import { existsSync } from "node:fs";
 import type { Server } from "node:http";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createContentPermissions } from "./integrations/univer/content-permissions.js";
 import { apiReference } from "@scalar/express-api-reference";
 import express from "express";
@@ -142,6 +143,20 @@ import {
   createExchangeRouter,
   type ExchangeModule,
 } from "./modules/exchange/index.js";
+
+const PACKAGE_ROOT = fileURLToPath(new URL("../..", import.meta.url));
+
+// Resolve a deployment-relative path against the likely runtime working directories.
+// Vercel serverless functions may run with a working directory that differs from the
+// project root, so we probe a few candidate bases and return the first that exists.
+function resolveDeployPath(relativePath: string): string {
+  const bases = [process.cwd(), resolve(process.cwd(), "apps/workspace"), PACKAGE_ROOT];
+  for (const base of bases) {
+    const candidate = resolve(base, relativePath);
+    if (existsSync(candidate)) return candidate;
+  }
+  return resolve(PACKAGE_ROOT, relativePath);
+}
 
 export interface WorkspaceApplication {
   readonly app: express.Express;
@@ -430,7 +445,7 @@ export function createWorkspaceApplication(
     });
   }
   app.get("/openapi.yaml", (_request, response) => {
-    const filename = resolve("generated/http/openapi.bundled.yaml");
+    const filename = resolveDeployPath(`${process.env.WORKSPACE_GENERATED_DIR ?? "generated"}/http/openapi.bundled.yaml`);
     if (!existsSync(filename)) {
       response
         .status(503)
@@ -525,7 +540,7 @@ export function createWorkspaceApplication(
   app.use(createStandaloneAppRouter({ identity, access, blobs }));
   app.use("/api", notFoundHandler);
 
-  const publicDirectory = resolve("dist/public");
+  const publicDirectory = resolveDeployPath(process.env.WORKSPACE_PUBLIC_DIR ?? "dist/public");
   if (existsSync(publicDirectory)) {
     app.use(createStaticSiteRouter(publicDirectory, { nodes, identity, permissions, publicOrigin: config.publicOrigin }));
   }

@@ -57,7 +57,7 @@ export function createPostgresRepositories(database: PostgresDatabase): ProductR
 export async function openPostgresProductDatabase(
   config: Extract<ProductDatabaseConfig, { provider: "postgres" }>,
 ): Promise<ProductDatabase> {
-  const pool = new Pool({ connectionString: config.connectionString });
+  const pool = new Pool({ connectionString: config.connectionString, max: Number(process.env.PG_POOL_MAX ?? 10) });
   pool.on("error", (error) => logger.warn({ code: "code" in error ? error.code : undefined }, "Idle PostgreSQL connection lost"));
   try {
     await initializePostgresSchema(pool);
