@@ -13,8 +13,8 @@
   },
   "rewrites": [
     {
-      "source": "/(.*)",
-      "destination": "/api"
+      "source": "/:path*",
+      "destination": "/api?__vpath=/:path*"
     }
   ],
   "env": {

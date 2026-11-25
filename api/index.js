@@ -6,16 +6,30 @@
 // WebSocket sync is intentionally omitted; single-user editing and collaboration
 // changeset/snapshot HTTP endpoints work against Supabase Postgres + S3.
 
-import { loadConfig } from "../apps/workspace/dist/server/config.js";
-import { openPostgresProductDatabase } from "../apps/workspace/dist/server/db/postgres/open.js";
-import { openPostgresCollaborationDatabase } from "../apps/workspace/dist/server/integrations/univer/collaboration-database/postgres/open.js";
-import { createWorkspaceApplication } from "../apps/workspace/dist/server/app.js";
+function normalizeBooleanEnv(name) {
+  const raw = process.env[name]?.trim();
+  if (!raw) {
+    delete process.env[name];
+    return;
+  }
+  const lower = raw.toLowerCase();
+  if (lower === "true" || lower === "1" || lower === "yes") {
+    process.env[name] = "true";
+  } else if (lower === "false" || lower === "0" || lower === "no") {
+    process.env[name] = "false";
+  } else {
+    process.env[name] = raw;
+  }
+}
 
 function normalizeEnvironment() {
   if (!process.env.PUBLIC_ORIGIN) {
     const host = process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
     if (host) process.env.PUBLIC_ORIGIN = `https://${host}`;
   }
+  normalizeBooleanEnv("BLOB_S3_FORCE_PATH_STYLE");
+  normalizeBooleanEnv("SECURE_COOKIES");
+  normalizeBooleanEnv("PASSWORD_AUTH_ENABLED");
   if (process.env.BLOB_S3_ENDPOINT?.includes(".storage.supabase.co") && !process.env.BLOB_S3_FORCE_PATH_STYLE) {
     process.env.BLOB_S3_FORCE_PATH_STYLE = "true";
   }
@@ -85,9 +99,9 @@ function buildPostgresCandidates(rawUrl) {
   return candidates;
 }
 
-async function openPostgresWithFallback(connectionString) {
+async function openPostgresWithFallback(openPostgresProductDatabase, connectionString) {
   const candidates = buildPostgresCandidates(connectionString);
-  let lastError;
+  const errors = [];
   for (const candidate of candidates) {
     try {
       const database = await openPostgresProductDatabase({
@@ -96,21 +110,67 @@ async function openPostgresWithFallback(connectionString) {
       });
       return { database, connectionString: candidate };
     } catch (error) {
-      lastError = error;
+      const host = (() => {
+        try {
+          return new URL(candidate).hostname;
+        } catch {
+          return "unknown";
+        }
+      })();
+      errors.push(`${host}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  throw lastError;
+  throw new Error(`All PostgreSQL connection candidates failed: ${errors.join(" | ")}`);
+}
+
+function restoreRewrittenUrl(req) {
+  if (!req.url) return;
+  const parsed = new URL(req.url, "http://localhost");
+  const vpath = parsed.searchParams.get("__vpath");
+  if (vpath !== null) {
+    parsed.searchParams.delete("__vpath");
+    const search = parsed.searchParams.toString();
+    const normalizedPath = vpath.startsWith("/") ? vpath : `/${vpath}`;
+    req.url = search ? `${normalizedPath}?${search}` : normalizedPath;
+  }
+}
+
+function redactSecrets(text) {
+  let out = String(text ?? "");
+  out = out.replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "postgresql://[REDACTED]");
+  for (const key of ["DATABASE_URL", "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID"]) {
+    const val = process.env[key];
+    if (val && val.length >= 4) {
+      out = out.split(val).join("[REDACTED]");
+    }
+  }
+  return out;
 }
 
 let appPromise = null;
 
 async function boot() {
   normalizeEnvironment();
+  const [
+    { loadConfig },
+    { openPostgresProductDatabase },
+    { openPostgresCollaborationDatabase },
+    { createWorkspaceApplication },
+  ] = await Promise.all([
+    import("../apps/workspace/dist/server/config.js"),
+    import("../apps/workspace/dist/server/db/postgres/open.js"),
+    import("../apps/workspace/dist/server/integrations/univer/collaboration-database/postgres/open.js"),
+    import("../apps/workspace/dist/server/app.js"),
+  ]);
+
   const config = loadConfig();
   if (config.database.provider !== "postgres" || !config.s3BlobStore) {
     throw new Error("Vercel serverless deployment requires DATABASE_PROVIDER=postgres and BLOB_STORE=s3");
   }
-  const { database, connectionString } = await openPostgresWithFallback(config.database.connectionString);
+  const { database, connectionString } = await openPostgresWithFallback(
+    openPostgresProductDatabase,
+    config.database.connectionString,
+  );
   let collaboration;
   try {
     collaboration = await openPostgresCollaborationDatabase(connectionString, config.s3BlobStore);
@@ -125,12 +185,36 @@ async function boot() {
 }
 
 export default async function handler(req, res) {
-  if (!appPromise) {
-    appPromise = boot().catch((error) => {
-      appPromise = null;
-      throw error;
-    });
+  restoreRewrittenUrl(req);
+  const parsedUrl = new URL(req.url || "/", "http://localhost");
+  const isDiagHealth = parsedUrl.pathname === "/healthz" && parsedUrl.searchParams.get("diag") === "1";
+
+  try {
+    if (!appPromise) {
+      appPromise = boot().catch((error) => {
+        appPromise = null;
+        throw error;
+      });
+    }
+    const app = await appPromise;
+    if (isDiagHealth) {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.end("<!doctype html><title>Univer Workspace Health</title><pre>STATUS: OK</pre>");
+      return;
+    }
+    return app(req, res);
+  } catch (error) {
+    const summary = redactSecrets(error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}` : String(error));
+    console.error("Workspace serverless boot failed:", summary);
+    if (isDiagHealth) {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.end(`<!doctype html><title>Univer Workspace Boot Error</title><pre>${summary.replaceAll("&", "&amp;").replaceAll("<", "&lt;")}</pre>`);
+      return;
+    }
+    res.statusCode = 500;
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.end(JSON.stringify({ error: { code: "BOOT_FAILED", message: redactSecrets(error instanceof Error ? error.message : String(error)) } }));
   }
-  const app = await appPromise;
-  return app(req, res);
 }
