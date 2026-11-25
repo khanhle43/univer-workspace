@@ -1,0 +1,26 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "pnpm install --frozen-lockfile",
+  "buildCommand": "pnpm --filter @univerjs/univer-workspace build",
+  "outputDirectory": "apps/workspace/dist/public",
+  "functions": {
+    "api/[[...slug]].ts": {
+      "maxDuration": 60,
+      "memory": 1024,
+      "includeFiles": "apps/workspace/dist/public/**,apps/workspace/generated/http/**"
+    }
+  },
+  "env": {
+    "NODE_ENV": "production",
+    "DATABASE_PROVIDER": "postgres",
+    "BLOB_STORE": "s3",
+    "SECURE_COOKIES": "true",
+    "TRUST_PROXY": "1",
+    "PASSWORD_AUTH_ENABLED": "true",
+    "PG_POOL_MAX": "3",
+    "WORKSPACE_PUBLIC_DIR": "apps/workspace/dist/public",
+    "WORKSPACE_GENERATED_DIR": "apps/workspace/generated",
+    "LOG_LEVEL": "info"
+  }
+}

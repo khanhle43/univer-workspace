@@ -12,7 +12,7 @@ export async function openPostgresCollaborationDatabase(
   connectionString: string,
   storage: S3BlobStoreOptions,
 ): Promise<CollaborationDatabase> {
-  const pool = new Pool({ connectionString });
+  const pool = new Pool({ connectionString, max: Number(process.env.PG_POOL_MAX ?? 10) });
   pool.on("error", (error) =>
     logger.warn(
       { code: "code" in error ? error.code : undefined },

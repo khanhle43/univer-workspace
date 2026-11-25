@@ -430,7 +430,7 @@ export function createWorkspaceApplication(
     });
   }
   app.get("/openapi.yaml", (_request, response) => {
-    const filename = resolve("generated/http/openapi.bundled.yaml");
+    const filename = resolve(process.cwd(), process.env.WORKSPACE_GENERATED_DIR ?? "generated", "http/openapi.bundled.yaml");
     if (!existsSync(filename)) {
       response
         .status(503)
@@ -525,7 +525,7 @@ export function createWorkspaceApplication(
   app.use(createStandaloneAppRouter({ identity, access, blobs }));
   app.use("/api", notFoundHandler);
 
-  const publicDirectory = resolve("dist/public");
+  const publicDirectory = resolve(process.cwd(), process.env.WORKSPACE_PUBLIC_DIR ?? "dist/public");
   if (existsSync(publicDirectory)) {
     app.use(createStaticSiteRouter(publicDirectory, { nodes, identity, permissions, publicOrigin: config.publicOrigin }));
   }
