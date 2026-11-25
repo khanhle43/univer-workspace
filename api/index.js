@@ -61,7 +61,12 @@ function compileModuleInstanceAsEsm(mod, filename) {
     mod.exports = preloadedEsmByPath.get(filename);
   } else {
     const source = readFileSync(filename, "utf8");
-    mod._compile(source, filename, "module");
+    // Vercel's /opt/rust/bytecode.js wraps Module.prototype._compile and drops the
+    // 3rd `format` argument when `filename` ends with ".js". Passing `${filename}.mjs`
+    // keeps the exact directory for relative imports while preserving format="module".
+    const compileFilename = filename.endsWith(".js") ? `${filename}.mjs` : filename;
+    mod._compile(source, compileFilename, "module");
+    mod.filename = filename;
   }
   mod.loaded = true;
 }
@@ -181,18 +186,19 @@ function installModuleCompatibilityHooks() {
   }
 }
 
-function supportsSyncCompileModule() {
+function supportsSyncCompileModuleInTask() {
   try {
-    const probe = new Module("/tmp/__esm_probe.mjs");
-    probe.filename = "/tmp/__esm_probe.mjs";
-    probe._compile("export const ok = 1;", "/tmp/__esm_probe.mjs", "module");
+    const probeFile = resolve(process.cwd(), "__esm_probe.js.mjs");
+    const probe = new Module(probeFile);
+    probe.filename = probeFile;
+    probe._compile("export const ok = 1;", probeFile, "module");
     return probe.exports?.ok === 1;
   } catch {
     return false;
   }
 }
 
-async function preloadPnpmEsmPackagesFallback() {
+async function preloadPnpmEsmPackages() {
   const pnpmRoot = resolve(process.cwd(), "node_modules/.pnpm");
   if (!existsSync(pnpmRoot)) return;
 
@@ -215,6 +221,8 @@ async function preloadPnpmEsmPackagesFallback() {
     }
   }
 
+  const preloadAllSubfiles = !supportsSyncCompileModuleInTask();
+
   for (const pkgDir of pkgDirs) {
     const pjPath = join(pkgDir, "package.json");
     if (!existsSync(pjPath)) continue;
@@ -225,6 +233,10 @@ async function preloadPnpmEsmPackagesFallback() {
       continue;
     }
     if (pj.type !== "module") continue;
+
+    // Skip CLI/dev-only ESM packages if any were traced
+    if (typeof pj.name === "string" && (pj.name.startsWith("@babel/") || pj.name === "vite")) continue;
+
     try {
       const dummyParent = new Module(join(pkgDir, "__resolver__.cjs"));
       dummyParent.filename = dummyParent.id;
@@ -232,19 +244,44 @@ async function preloadPnpmEsmPackagesFallback() {
       const entryFile = Module._resolveFilename(pkgDir, dummyParent, false);
       if (!preloadedEsmByPath.has(entryFile)) {
         const ns = await import(pathToFileURL(entryFile).href);
-        preloadedEsmByPath.set(entryFile, ns);
+        preloadedEsmByPath.set(entryFile, toCjsCompatibleEsmExports(ns));
       }
     } catch {
-      // Ignore packages without a default root export or side-effect-only packages.
+      // Ignore packages without a root export or browser-only side-effect modules.
+    }
+
+    if (preloadAllSubfiles && (pj.name === "lodash-es" || pj.name?.startsWith("@noble/"))) {
+      try {
+        for (const file of readdirSync(pkgDir, { withFileTypes: true })) {
+          if (!file.isFile() || !file.name.endsWith(".js")) continue;
+          const full = join(pkgDir, file.name);
+          if (!preloadedEsmByPath.has(full)) {
+            const ns = await import(pathToFileURL(full).href);
+            preloadedEsmByPath.set(full, toCjsCompatibleEsmExports(ns));
+          }
+        }
+      } catch {
+        // Ignore individual subfile failures.
+      }
     }
   }
 }
 
+function toCjsCompatibleEsmExports(ns) {
+  // Match Node's native require(esm) Module Namespace shape (__esModule: true + all named/default exports).
+  if (!ns || typeof ns !== "object") return ns;
+  const out = Object.create(null);
+  Object.defineProperty(out, "__esModule", { value: true, enumerable: false });
+  for (const key of Reflect.ownKeys(ns)) {
+    const desc = Object.getOwnPropertyDescriptor(ns, key);
+    if (desc) Object.defineProperty(out, key, desc);
+  }
+  return out;
+}
+
 async function ensureModuleRuntimeSupport() {
   installModuleCompatibilityHooks();
-  if (!supportsSyncCompileModule()) {
-    await preloadPnpmEsmPackagesFallback();
-  }
+  await preloadPnpmEsmPackages();
 }
 
 function normalizeBooleanEnv(name) {
