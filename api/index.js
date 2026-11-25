@@ -10,6 +10,7 @@ import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import Module from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { Script } from "node:vm";
 
 const preloadedEsmByPath = new Map();
 const cjsExportsRegistry = (globalThis.__univerCjsExports ??= new Map());
@@ -194,6 +195,52 @@ function collectPackageExportSpecifiers(pj, pkgDir) {
   return [...specs];
 }
 
+function shouldSkipPackagePreload(pkgName) {
+  if (typeof pkgName !== "string") return false;
+  if (pkgName === "vite" || pkgName === "typescript" || pkgName === "esbuild") return true;
+  if (pkgName.startsWith("@babel/") || pkgName.startsWith("@types/")) return true;
+  if (
+    pkgName.endsWith("-ui") ||
+    pkgName === "@univerjs/ui" ||
+    pkgName === "@univerjs/design" ||
+    pkgName === "@univerjs/themes" ||
+    pkgName.startsWith("@univerjs/preset") ||
+    pkgName.startsWith("@univerjs/icons")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isEsmSourceFile(filePath, pkgType) {
+  if (filePath.endsWith(".cjs") || filePath.endsWith(".json") || filePath.endsWith(".node")) {
+    return false;
+  }
+  if (filePath.endsWith(".mjs")) return true;
+  if (!filePath.endsWith(".js")) return false;
+  if (pkgType === "module") return true;
+  try {
+    const raw = readFileSync(filePath, "utf8");
+    if (!raw) return false;
+    const body = raw.startsWith("#!") ? raw.replace(/^#!.*\r?\n/, "") : raw;
+    new Script(Module.wrap(body));
+    return false;
+  } catch (err) {
+    return err instanceof SyntaxError;
+  }
+}
+
+function packagePreloadPriority(pj) {
+  const name = typeof pj.name === "string" ? pj.name : "";
+  if (pj.type === "module" && !name.startsWith("@univerjs")) return 0;
+  if (pj.type === "module") return 1;
+  if (!name.startsWith("@univerjs")) return 2;
+  if (name === "@univerjs/protocol" || name === "@univerjs/telemetry") return 3;
+  if (name === "@univerjs/core") return 4;
+  if (name.startsWith("@univerjs/")) return 5;
+  return 6;
+}
+
 async function preloadPnpmEsmPackages() {
   const apiDir = dirname(fileURLToPath(import.meta.url));
   const candidates = [
@@ -204,37 +251,42 @@ async function preloadPnpmEsmPackages() {
   const pnpmRoot = candidates.find((p) => existsSync(p));
   if (!pnpmRoot) return;
 
-  const pkgEntries = [];
+  const pkgRecords = [];
   for (const storeEntry of readdirSync(pnpmRoot, { withFileTypes: true })) {
     if (!storeEntry.isDirectory()) continue;
     const nmDir = join(pnpmRoot, storeEntry.name, "node_modules");
     if (!existsSync(nmDir)) continue;
     for (const entry of readdirSync(nmDir, { withFileTypes: true })) {
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      const dirs = [];
       if (entry.name.startsWith("@")) {
         const scopeDir = join(nmDir, entry.name);
         if (!existsSync(scopeDir)) continue;
         for (const sub of readdirSync(scopeDir, { withFileTypes: true })) {
-          pkgEntries.push({ nmDir, pkgDir: join(scopeDir, sub.name) });
+          dirs.push(join(scopeDir, sub.name));
         }
       } else {
-        pkgEntries.push({ nmDir, pkgDir: join(nmDir, entry.name) });
+        dirs.push(join(nmDir, entry.name));
+      }
+      for (const pkgDir of dirs) {
+        const pjPath = join(pkgDir, "package.json");
+        if (!existsSync(pjPath)) continue;
+        try {
+          const pj = JSON.parse(readFileSync(pjPath, "utf8"));
+          if (!shouldSkipPackagePreload(pj.name)) {
+            pkgRecords.push({ nmDir, pkgDir, pj, priority: packagePreloadPriority(pj) });
+          }
+        } catch {
+          // Ignore malformed package.json files.
+        }
       }
     }
   }
 
-  for (const { nmDir, pkgDir } of pkgEntries) {
-    const pjPath = join(pkgDir, "package.json");
-    if (!existsSync(pjPath)) continue;
-    let pj;
-    try {
-      pj = JSON.parse(readFileSync(pjPath, "utf8"));
-    } catch {
-      continue;
-    }
-    if (pj.type !== "module") continue;
-    if (typeof pj.name === "string" && (pj.name.startsWith("@babel/") || pj.name === "vite")) continue;
+  pkgRecords.sort((a, b) => a.priority - b.priority);
 
+  const esmFilesToImport = [];
+  for (const { nmDir, pkgDir, pj } of pkgRecords) {
     const dummyParent = new Module(join(nmDir, "__resolver__.cjs"));
     dummyParent.filename = dummyParent.id;
     dummyParent.paths = [nmDir, ...Module._nodeModulePaths(nmDir)];
@@ -242,30 +294,43 @@ async function preloadPnpmEsmPackages() {
     for (const spec of collectPackageExportSpecifiers(pj, pkgDir)) {
       try {
         const entryFile = Module._resolveFilename(spec, dummyParent, false);
-        if (!entryFile.endsWith(".cjs") && lookupPreloadedEsm(entryFile) === undefined) {
-          const ns = await import(pathToFileURL(entryFile).href);
-          registerPreloadedEsm(entryFile, ns);
+        if (isEsmSourceFile(entryFile, pj.type)) {
+          esmFilesToImport.push(entryFile);
         }
       } catch {
-        // Ignore subpaths without CJS/default resolution or browser-only modules.
+        // Ignore subpaths without CJS/default resolution.
       }
     }
 
     // Also preload flat .js modules for subpath-imported ESM packages (e.g. lodash-es/debounce.js).
-    if (!pj.exports || pj.name === "lodash-es" || pj.name?.startsWith("@noble/")) {
+    if (pj.type === "module" && (!pj.exports || pj.name === "lodash-es" || pj.name?.startsWith("@noble/"))) {
       try {
         for (const file of readdirSync(pkgDir, { withFileTypes: true })) {
           if (!file.isFile() || !file.name.endsWith(".js")) continue;
-          const full = join(pkgDir, file.name);
-          if (lookupPreloadedEsm(full) === undefined) {
-            const ns = await import(pathToFileURL(full).href);
-            registerPreloadedEsm(full, ns);
-          }
+          esmFilesToImport.push(join(pkgDir, file.name));
         }
       } catch {
-        // Ignore individual subfile failures.
+        // Ignore individual subfile scan failures.
       }
     }
+  }
+
+  let pending = esmFilesToImport;
+  for (let pass = 0; pass < 3 && pending.length > 0; pass++) {
+    const retry = [];
+    let madeProgress = false;
+    for (const entryFile of pending) {
+      if (lookupPreloadedEsm(entryFile) !== undefined) continue;
+      try {
+        const ns = await import(pathToFileURL(entryFile).href);
+        registerPreloadedEsm(entryFile, ns);
+        madeProgress = true;
+      } catch {
+        retry.push(entryFile);
+      }
+    }
+    if (!madeProgress) break;
+    pending = retry;
   }
 }
 
