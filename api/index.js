@@ -188,8 +188,9 @@ function collectPackageExportSpecifiers(pj, pkgDir) {
     } else {
       specs.add(name);
     }
+  } else {
+    specs.add(pkgDir);
   }
-  specs.add(pkgDir);
   return [...specs];
 }
 
@@ -241,7 +242,7 @@ async function preloadPnpmEsmPackages() {
     for (const spec of collectPackageExportSpecifiers(pj, pkgDir)) {
       try {
         const entryFile = Module._resolveFilename(spec, dummyParent, false);
-        if (!isCommonJsFile(entryFile) && lookupPreloadedEsm(entryFile) === undefined) {
+        if (!entryFile.endsWith(".cjs") && lookupPreloadedEsm(entryFile) === undefined) {
           const ns = await import(pathToFileURL(entryFile).href);
           registerPreloadedEsm(entryFile, ns);
         }
