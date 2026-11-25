@@ -6,6 +6,120 @@
 // WebSocket sync is intentionally omitted; single-user editing and collaboration
 // changeset/snapshot HTTP endpoints work against Supabase Postgres + S3.
 
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import Module from "node:module";
+import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const preloadedEsmByPath = new Map();
+let esmSupportInstalled = false;
+
+function installRequireEsmExtensions() {
+  if (esmSupportInstalled) return;
+  esmSupportInstalled = true;
+
+  const compileAsEsm = (mod, filename) => {
+    if (preloadedEsmByPath.has(filename)) {
+      mod.exports = preloadedEsmByPath.get(filename);
+      return;
+    }
+    const source = readFileSync(filename, "utf8");
+    return mod._compile(source, filename, "module");
+  };
+
+  const prevJs = Module._extensions[".js"];
+  if (typeof prevJs === "function") {
+    Module._extensions[".js"] = function patchedJsExtension(mod, filename) {
+      try {
+        return prevJs.call(this, mod, filename);
+      } catch (err) {
+        if (err && err.code === "ERR_REQUIRE_ESM") {
+          return compileAsEsm(mod, filename);
+        }
+        throw err;
+      }
+    };
+  }
+
+  const prevMjs = Module._extensions[".mjs"];
+  Module._extensions[".mjs"] = function patchedMjsExtension(mod, filename) {
+    if (typeof prevMjs === "function") {
+      try {
+        return prevMjs.call(this, mod, filename);
+      } catch (err) {
+        if (!err || err.code !== "ERR_REQUIRE_ESM") throw err;
+      }
+    }
+    return compileAsEsm(mod, filename);
+  };
+}
+
+function supportsSyncCompileModule() {
+  try {
+    const probe = new Module("/tmp/__esm_probe.mjs");
+    probe.filename = "/tmp/__esm_probe.mjs";
+    probe._compile("export const ok = 1;", "/tmp/__esm_probe.mjs", "module");
+    return probe.exports?.ok === 1;
+  } catch {
+    return false;
+  }
+}
+
+async function preloadPnpmEsmPackagesFallback() {
+  const pnpmRoot = resolve(process.cwd(), "node_modules/.pnpm");
+  if (!existsSync(pnpmRoot)) return;
+
+  const pkgDirs = [];
+  for (const storeEntry of readdirSync(pnpmRoot, { withFileTypes: true })) {
+    if (!storeEntry.isDirectory()) continue;
+    const nmDir = join(pnpmRoot, storeEntry.name, "node_modules");
+    if (!existsSync(nmDir)) continue;
+    for (const entry of readdirSync(nmDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      if (entry.name.startsWith("@")) {
+        const scopeDir = join(nmDir, entry.name);
+        if (!existsSync(scopeDir)) continue;
+        for (const sub of readdirSync(scopeDir, { withFileTypes: true })) {
+          pkgDirs.push(join(scopeDir, sub.name));
+        }
+      } else {
+        pkgDirs.push(join(nmDir, entry.name));
+      }
+    }
+  }
+
+  for (const pkgDir of pkgDirs) {
+    const pjPath = join(pkgDir, "package.json");
+    if (!existsSync(pjPath)) continue;
+    let pj;
+    try {
+      pj = JSON.parse(readFileSync(pjPath, "utf8"));
+    } catch {
+      continue;
+    }
+    if (pj.type !== "module") continue;
+    try {
+      const dummyParent = new Module(join(pkgDir, "__resolver__.cjs"));
+      dummyParent.filename = dummyParent.id;
+      dummyParent.paths = Module._nodeModulePaths(dirname(dummyParent.id));
+      const entryFile = Module._resolveFilename(pkgDir, dummyParent, false);
+      if (!preloadedEsmByPath.has(entryFile)) {
+        const ns = await import(pathToFileURL(entryFile).href);
+        preloadedEsmByPath.set(entryFile, ns);
+      }
+    } catch {
+      // Ignore packages without a default root export or side-effect-only packages.
+    }
+  }
+}
+
+async function ensureRequireEsmSupport() {
+  installRequireEsmExtensions();
+  if (!supportsSyncCompileModule()) {
+    await preloadPnpmEsmPackagesFallback();
+  }
+}
+
 function normalizeBooleanEnv(name) {
   const raw = process.env[name]?.trim();
   if (!raw) {
@@ -150,6 +264,7 @@ function redactSecrets(text) {
 let appPromise = null;
 
 async function boot() {
+  await ensureRequireEsmSupport();
   normalizeEnvironment();
   const [
     { loadConfig },

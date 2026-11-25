@@ -7,14 +7,13 @@
   "functions": {
     "api/index.js": {
       "maxDuration": 60,
-      "memory": 1024,
       "includeFiles": "apps/workspace/dist/public/index.html,apps/workspace/generated/http/**,apps/workspace/dist/server/**/*.sql"
     }
   },
   "rewrites": [
     {
-      "source": "/:path*",
-      "destination": "/api?__vpath=/:path*"
+      "source": "/:__vpath*",
+      "destination": "/api?__vpath=/:__vpath*"
     }
   ],
   "env": {
