@@ -111,11 +111,13 @@ function installModuleCompatibilityHooks() {
     };
   }
 
-  // 2. Vercel bytecode caching (VERCEL_USE_BYTECODE_CACHING) replaces CJS .js files
-  //    on disk with bytecode stubs, so Node's static cjs-module-lexer sees zero named
-  //    exports when an ESM module imports a CJS package. Use nextLoad() so Node's own
-  //    parser distinguishes ESM (including typeless dual packages like @univerjs/protocol)
-  //    from CommonJS, and never intercept require() calls.
+  // 2. Vercel runs with typeless ESM detection disabled (nextLoad returns format="commonjs"
+  //    for typeless ESM .js packages like @univerjs/protocol and @wendellhu/redi) AND
+  //    VERCEL_USE_BYTECODE_CACHING replaces CJS .js files on disk with bytecode stubs
+  //    (so Node's static cjs-module-lexer sees zero named exports). Handle both cleanly:
+  //    - Never intercept require() calls.
+  //    - If a file inside node_modules is actually ESM source, return format="module".
+  //    - Otherwise execute the CJS module via require() and synthesize live named exports.
   if (typeof Module.registerHooks === "function") {
     Module.registerHooks({
       load(url, context, nextLoad) {
@@ -129,6 +131,13 @@ function installModuleCompatibilityHooks() {
           url.includes("/node_modules/")
         ) {
           const filename = fileURLToPath(url);
+          if (isEsmSourceFile(filename)) {
+            return {
+              format: "module",
+              shortCircuit: true,
+              source: readFileSync(filename, "utf8"),
+            };
+          }
           const exp = cjsRequire(filename);
           cjsExportsRegistry.set(url, exp);
           const lines = [
@@ -236,6 +245,7 @@ function shouldSkipPackagePreload(pkgName) {
 }
 
 const ESM_KEYWORD_RE = /\b(?:import|export)\b/;
+const CJS_SHIM_RE = /\b(?:module\.exports|exports\.[A-Za-z_$])\b/;
 
 function isEsmSourceFile(filePath, pkgType) {
   if (filePath.endsWith(".cjs") || filePath.endsWith(".json") || filePath.endsWith(".node")) {
@@ -253,8 +263,9 @@ function isEsmSourceFile(filePath, pkgType) {
   try {
     const raw = readFileSync(filePath, "utf8");
     if (!raw || raw.startsWith("#!")) return false;
-    if (pkgType === "module") return true;
-    if (!ESM_KEYWORD_RE.test(raw)) return false;
+    if (!ESM_KEYWORD_RE.test(raw)) {
+      return pkgType === "module" && !CJS_SHIM_RE.test(raw);
+    }
     new Script(Module.wrap(raw));
     return false;
   } catch (err) {
@@ -416,7 +427,10 @@ async function preloadPnpmEsmPackages() {
 
     // Walk full directory tree for type="module" packages and @univerjs* packages
     // so wildcard exports (e.g. "./*": "./*") and direct subpath requires (lib/es/*.js) are covered.
-    if (pj.type === "module" || (typeof pj.name === "string" && pj.name.startsWith("@univerjs"))) {
+    if (
+      pj.type === "module" ||
+      (typeof pj.name === "string" && (pj.name.startsWith("@univerjs") || pj.name.startsWith("@wendellhu/")))
+    ) {
       const found = new Set();
       walkPackageJsFiles(pkgDir, pj.type, binPaths, found);
       for (const f of found) enqueue(f);
