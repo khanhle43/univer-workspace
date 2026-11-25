@@ -16,6 +16,13 @@ const preloadedEsmByPath = new Map();
 const cjsExportsRegistry = (globalThis.__univerCjsExports ??= new Map());
 const cjsRequire = Module.createRequire(import.meta.url);
 let moduleHooksInstalled = false;
+const preloadDiag = {
+  pnpmRoot: null,
+  packagesScanned: 0,
+  esmDetected: 0,
+  esmPreloaded: 0,
+  failed: [],
+};
 
 const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 const RESERVED_WORDS = new Set([
@@ -89,6 +96,20 @@ function installModuleCompatibilityHooks() {
       return prevMjs.call(this, mod, filename);
     }
   };
+
+  const prevCompile = Module.prototype._compile;
+  if (typeof prevCompile === "function") {
+    Module.prototype._compile = function patchedCompile(content, filename, format) {
+      if (format === "module") {
+        const preloaded = lookupPreloadedEsm(filename);
+        if (preloaded !== undefined) {
+          this.exports = preloaded;
+          return;
+        }
+      }
+      return prevCompile.call(this, content, filename, format);
+    };
+  }
 
   // 2. Vercel bytecode caching (VERCEL_USE_BYTECODE_CACHING) replaces CJS .js files
   //    on disk with bytecode stubs, so Node's static cjs-module-lexer sees zero named
@@ -198,7 +219,9 @@ function collectPackageExportSpecifiers(pj, pkgDir) {
 function shouldSkipPackagePreload(pkgName) {
   if (typeof pkgName !== "string") return false;
   if (pkgName === "vite" || pkgName === "typescript" || pkgName === "esbuild") return true;
-  if (pkgName.startsWith("@babel/") || pkgName.startsWith("@types/")) return true;
+  if (pkgName.startsWith("swagger-ui") || pkgName.startsWith("@babel/") || pkgName.startsWith("@types/")) {
+    return true;
+  }
   if (
     pkgName.endsWith("-ui") ||
     pkgName === "@univerjs/ui" ||
@@ -212,21 +235,81 @@ function shouldSkipPackagePreload(pkgName) {
   return false;
 }
 
+const ESM_KEYWORD_RE = /\b(?:import|export)\b/;
+
 function isEsmSourceFile(filePath, pkgType) {
   if (filePath.endsWith(".cjs") || filePath.endsWith(".json") || filePath.endsWith(".node")) {
     return false;
   }
-  if (filePath.endsWith(".mjs")) return true;
+  if (filePath.endsWith(".mjs")) {
+    try {
+      const head = readFileSync(filePath, "utf8");
+      return !head.startsWith("#!");
+    } catch {
+      return false;
+    }
+  }
   if (!filePath.endsWith(".js")) return false;
-  if (pkgType === "module") return true;
   try {
     const raw = readFileSync(filePath, "utf8");
-    if (!raw) return false;
-    const body = raw.startsWith("#!") ? raw.replace(/^#!.*\r?\n/, "") : raw;
-    new Script(Module.wrap(body));
+    if (!raw || raw.startsWith("#!")) return false;
+    if (pkgType === "module") return true;
+    if (!ESM_KEYWORD_RE.test(raw)) return false;
+    new Script(Module.wrap(raw));
     return false;
   } catch (err) {
     return err instanceof SyntaxError;
+  }
+}
+
+function collectExportTargetStrings(val, out) {
+  if (typeof val === "string") {
+    if (val.startsWith("./") && !val.includes("*")) out.add(val);
+    return;
+  }
+  if (Array.isArray(val)) {
+    for (const item of val) collectExportTargetStrings(item, out);
+    return;
+  }
+  if (val && typeof val === "object") {
+    for (const v of Object.values(val)) collectExportTargetStrings(v, out);
+  }
+}
+
+function collectBinPaths(pkgDir, pj) {
+  const bins = new Set();
+  if (typeof pj.bin === "string") {
+    bins.add(resolve(pkgDir, pj.bin));
+  } else if (pj.bin && typeof pj.bin === "object") {
+    for (const b of Object.values(pj.bin)) {
+      if (typeof b === "string") bins.add(resolve(pkgDir, b));
+    }
+  }
+  return bins;
+}
+
+const SKIP_SUBDIRS = new Set(["node_modules", "bin", ".bin", "test", "tests", "__tests__", "types"]);
+
+function walkPackageJsFiles(dir, pkgType, binPaths, out) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) continue;
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (!SKIP_SUBDIRS.has(entry.name)) {
+        walkPackageJsFiles(full, pkgType, binPaths, out);
+      }
+    } else if (entry.isFile() && (entry.name.endsWith(".js") || entry.name.endsWith(".mjs"))) {
+      if (entry.name.endsWith(".d.ts") || binPaths.has(resolve(full))) continue;
+      if (isEsmSourceFile(full, pkgType)) {
+        out.add(full);
+      }
+    }
   }
 }
 
@@ -249,11 +332,13 @@ async function preloadPnpmEsmPackages() {
     resolve(apiDir, "../node_modules/.pnpm"),
   ];
   const pnpmRoot = candidates.find((p) => existsSync(p));
+  preloadDiag.pnpmRoot = pnpmRoot ?? null;
   if (!pnpmRoot) return;
 
+  const visitedPkgDirs = new Set();
   const pkgRecords = [];
   for (const storeEntry of readdirSync(pnpmRoot, { withFileTypes: true })) {
-    if (!storeEntry.isDirectory()) continue;
+    if (!storeEntry.isDirectory() && !storeEntry.isSymbolicLink()) continue;
     const nmDir = join(pnpmRoot, storeEntry.name, "node_modules");
     if (!existsSync(nmDir)) continue;
     for (const entry of readdirSync(nmDir, { withFileTypes: true })) {
@@ -263,18 +348,23 @@ async function preloadPnpmEsmPackages() {
         const scopeDir = join(nmDir, entry.name);
         if (!existsSync(scopeDir)) continue;
         for (const sub of readdirSync(scopeDir, { withFileTypes: true })) {
-          dirs.push(join(scopeDir, sub.name));
+          if (sub.isDirectory() || sub.isSymbolicLink()) {
+            dirs.push(join(scopeDir, sub.name));
+          }
         }
       } else {
         dirs.push(join(nmDir, entry.name));
       }
       for (const pkgDir of dirs) {
-        const pjPath = join(pkgDir, "package.json");
+        const realPkgDir = safeRealpath(pkgDir);
+        if (visitedPkgDirs.has(realPkgDir)) continue;
+        visitedPkgDirs.add(realPkgDir);
+        const pjPath = join(realPkgDir, "package.json");
         if (!existsSync(pjPath)) continue;
         try {
           const pj = JSON.parse(readFileSync(pjPath, "utf8"));
           if (!shouldSkipPackagePreload(pj.name)) {
-            pkgRecords.push({ nmDir, pkgDir, pj, priority: packagePreloadPriority(pj) });
+            pkgRecords.push({ nmDir, pkgDir: realPkgDir, pj, priority: packagePreloadPriority(pj) });
           }
         } catch {
           // Ignore malformed package.json files.
@@ -284,9 +374,20 @@ async function preloadPnpmEsmPackages() {
   }
 
   pkgRecords.sort((a, b) => a.priority - b.priority);
+  preloadDiag.packagesScanned = pkgRecords.length;
 
   const esmFilesToImport = [];
+  const queuedSet = new Set();
+  const enqueue = (f) => {
+    const rf = safeRealpath(f);
+    if (!queuedSet.has(rf)) {
+      queuedSet.add(rf);
+      esmFilesToImport.push(rf);
+    }
+  };
+
   for (const { nmDir, pkgDir, pj } of pkgRecords) {
+    const binPaths = collectBinPaths(pkgDir, pj);
     const dummyParent = new Module(join(nmDir, "__resolver__.cjs"));
     dummyParent.filename = dummyParent.id;
     dummyParent.paths = [nmDir, ...Module._nodeModulePaths(nmDir)];
@@ -294,44 +395,59 @@ async function preloadPnpmEsmPackages() {
     for (const spec of collectPackageExportSpecifiers(pj, pkgDir)) {
       try {
         const entryFile = Module._resolveFilename(spec, dummyParent, false);
-        if (isEsmSourceFile(entryFile, pj.type)) {
-          esmFilesToImport.push(entryFile);
+        if (!binPaths.has(resolve(entryFile)) && isEsmSourceFile(entryFile, pj.type)) {
+          enqueue(entryFile);
         }
       } catch {
         // Ignore subpaths without CJS/default resolution.
       }
     }
 
-    // Also preload flat .js modules for subpath-imported ESM packages (e.g. lodash-es/debounce.js).
-    if (pj.type === "module" && (!pj.exports || pj.name === "lodash-es" || pj.name?.startsWith("@noble/"))) {
-      try {
-        for (const file of readdirSync(pkgDir, { withFileTypes: true })) {
-          if (!file.isFile() || !file.name.endsWith(".js")) continue;
-          esmFilesToImport.push(join(pkgDir, file.name));
-        }
-      } catch {
-        // Ignore individual subfile scan failures.
+    const relTargets = new Set();
+    if (typeof pj.main === "string") relTargets.add(pj.main.startsWith(".") ? pj.main : `./${pj.main}`);
+    if (typeof pj.module === "string") relTargets.add(pj.module.startsWith(".") ? pj.module : `./${pj.module}`);
+    collectExportTargetStrings(pj.exports, relTargets);
+    for (const rel of relTargets) {
+      const targetPath = resolve(pkgDir, rel);
+      if (existsSync(targetPath) && !binPaths.has(targetPath) && isEsmSourceFile(targetPath, pj.type)) {
+        enqueue(targetPath);
       }
+    }
+
+    // Walk full directory tree for type="module" packages and @univerjs* packages
+    // so wildcard exports (e.g. "./*": "./*") and direct subpath requires (lib/es/*.js) are covered.
+    if (pj.type === "module" || (typeof pj.name === "string" && pj.name.startsWith("@univerjs"))) {
+      const found = new Set();
+      walkPackageJsFiles(pkgDir, pj.type, binPaths, found);
+      for (const f of found) enqueue(f);
     }
   }
 
+  preloadDiag.esmDetected = esmFilesToImport.length;
+
   let pending = esmFilesToImport;
-  for (let pass = 0; pass < 3 && pending.length > 0; pass++) {
+  let lastErrors = new Map();
+  for (let pass = 0; pass < 4 && pending.length > 0; pass++) {
     const retry = [];
+    lastErrors = new Map();
     let madeProgress = false;
     for (const entryFile of pending) {
       if (lookupPreloadedEsm(entryFile) !== undefined) continue;
       try {
         const ns = await import(pathToFileURL(entryFile).href);
         registerPreloadedEsm(entryFile, ns);
+        preloadDiag.esmPreloaded++;
         madeProgress = true;
-      } catch {
+      } catch (err) {
         retry.push(entryFile);
+        lastErrors.set(entryFile, err instanceof Error ? `${err.name}: ${err.message}` : String(err));
       }
     }
     if (!madeProgress) break;
     pending = retry;
   }
+
+  preloadDiag.failed = [...lastErrors.entries()].slice(0, 15).map(([file, error]) => ({ file, error }));
 }
 
 async function ensureModuleRuntimeSupport() {
@@ -556,7 +672,8 @@ export default async function handler(req, res) {
     }
     return app(req, res);
   } catch (error) {
-    const rawMsg = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}${extractNodeModulesSnippet(error.stack)}` : String(error);
+    const diagBlock = `\n\n--- preloadDiag ---\n${JSON.stringify(preloadDiag, null, 2)}`;
+    const rawMsg = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}${extractNodeModulesSnippet(error.stack)}${diagBlock}` : `${String(error)}${diagBlock}`;
     const summary = redactSecrets(rawMsg);
     console.error("Workspace serverless boot failed:", summary);
     if (isDiagHealth) {
