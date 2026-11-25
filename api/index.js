@@ -9,10 +9,50 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import Module from "node:module";
 import { dirname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const preloadedEsmByPath = new Map();
-let esmSupportInstalled = false;
+const cjsExportsRegistry = (globalThis.__univerCjsExports ??= new Map());
+const cjsRequire = Module.createRequire(import.meta.url);
+const packageTypeCache = new Map();
+let moduleHooksInstalled = false;
+
+const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+const RESERVED_WORDS = new Set([
+  "default", "break", "case", "catch", "class", "const", "continue", "debugger",
+  "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for",
+  "function", "if", "import", "in", "instanceof", "new", "null", "return", "super",
+  "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with",
+  "yield", "let", "static", "implements", "interface", "package", "private", "protected",
+  "public", "await", "__esModule",
+]);
+const FUNCTION_INTRINSICS = new Set(["length", "name", "prototype", "arguments", "caller"]);
+
+function isCommonJsFile(filename) {
+  if (filename.endsWith(".cjs")) return true;
+  if (!filename.endsWith(".js")) return false;
+  let dir = dirname(filename);
+  while (true) {
+    if (packageTypeCache.has(dir)) {
+      return packageTypeCache.get(dir) !== "module";
+    }
+    const pj = join(dir, "package.json");
+    if (existsSync(pj)) {
+      let pkgType = "commonjs";
+      try {
+        const data = JSON.parse(readFileSync(pj, "utf8"));
+        if (data.type === "module") pkgType = "module";
+      } catch {
+        pkgType = "commonjs";
+      }
+      packageTypeCache.set(dir, pkgType);
+      return pkgType !== "module";
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return true;
+    dir = parent;
+  }
+}
 
 function compileModuleInstanceAsEsm(mod, filename) {
   mod.filename = filename;
@@ -26,13 +66,13 @@ function compileModuleInstanceAsEsm(mod, filename) {
   mod.loaded = true;
 }
 
-function installRequireEsmHooks() {
-  if (esmSupportInstalled) return;
-  esmSupportInstalled = true;
+function installModuleCompatibilityHooks() {
+  if (moduleHooksInstalled) return;
+  moduleHooksInstalled = true;
 
-  // Vercel's Rust Node launcher (/opt/rust/nodejs.js) overrides Module.prototype.load
-  // and throws ERR_REQUIRE_ESM before reaching Module._extensions[".js"], even on
-  // Node 24/26 where native require(esm) is built into Module.prototype._compile.
+  // 1. Vercel's Rust Node launcher (/opt/rust/nodejs.js) overrides Module.prototype.load
+  //    and throws ERR_REQUIRE_ESM before reaching Module._extensions[".js"], even on
+  //    Node 24/26 where native require(esm) is built into Module.prototype._compile.
   const prevProtoLoad = Module.prototype.load;
   if (typeof prevProtoLoad === "function") {
     Module.prototype.load = function patchedProtoLoad(filename) {
@@ -99,6 +139,46 @@ function installRequireEsmHooks() {
     }
     compileModuleInstanceAsEsm(mod, filename);
   };
+
+  // 2. Vercel bytecode caching (VERCEL_USE_BYTECODE_CACHING) replaces CJS .js files
+  //    on disk with bytecode stubs, so Node's static cjs-module-lexer sees zero named
+  //    exports when an .mjs wrapper imports a CJS package. Execute the CJS module via
+  //    require() and synthesize live ESM named exports from its runtime exports object.
+  if (typeof Module.registerHooks === "function") {
+    Module.registerHooks({
+      load(url, context, nextLoad) {
+        if (url.startsWith("file://")) {
+          const filename = fileURLToPath(url);
+          if (filename.includes("/node_modules/") && isCommonJsFile(filename)) {
+            const exp = cjsRequire(filename);
+            cjsExportsRegistry.set(url, exp);
+            const lines = [
+              `const __exp = globalThis.__univerCjsExports.get(${JSON.stringify(url)});`,
+              `export default __exp;`,
+            ];
+            if ((exp && typeof exp === "object") || typeof exp === "function") {
+              const isFn = typeof exp === "function";
+              const rawKeys = new Set([
+                ...Object.keys(exp),
+                ...Object.getOwnPropertyNames(exp).filter((k) => !isFn || !FUNCTION_INTRINSICS.has(k)),
+                ...(exp.default && typeof exp.default === "object" ? Object.keys(exp.default) : []),
+              ]);
+              for (const k of rawKeys) {
+                if (IDENT_RE.test(k) && !RESERVED_WORDS.has(k)) {
+                  const keyLit = JSON.stringify(k);
+                  lines.push(
+                    `export const ${k} = __exp[${keyLit}] !== undefined ? __exp[${keyLit}] : __exp?.default?.[${keyLit}];`,
+                  );
+                }
+              }
+            }
+            return { format: "module", shortCircuit: true, source: lines.join("\n") };
+          }
+        }
+        return nextLoad(url, context);
+      },
+    });
+  }
 }
 
 function supportsSyncCompileModule() {
@@ -160,8 +240,8 @@ async function preloadPnpmEsmPackagesFallback() {
   }
 }
 
-async function ensureRequireEsmSupport() {
-  installRequireEsmHooks();
+async function ensureModuleRuntimeSupport() {
+  installModuleCompatibilityHooks();
   if (!supportsSyncCompileModule()) {
     await preloadPnpmEsmPackagesFallback();
   }
@@ -308,22 +388,39 @@ function redactSecrets(text) {
   return out;
 }
 
+function extractNodeModulesSnippet(stack) {
+  if (!stack) return "";
+  const match = /(?:file:\/\/)?(\/var\/task\/node_modules\/[^\s:)]+):(\d+):(\d+)/.exec(stack);
+  if (!match) return "";
+  const [, filePath, lineStr] = match;
+  try {
+    if (!existsSync(filePath)) return "";
+    const content = readFileSync(filePath, "utf8");
+    const lines = content.split("\n");
+    const lineNum = Math.max(1, Number(lineStr));
+    const start = Math.max(0, lineNum - 4);
+    const end = Math.min(lines.length, lineNum + 4);
+    const snippet = lines
+      .slice(start, end)
+      .map((l, idx) => `${start + idx + 1}: ${l.slice(0, 240)}`)
+      .join("\n");
+    return `\n\n--- ${filePath} ---\n${snippet}`;
+  } catch {
+    return "";
+  }
+}
+
 let appPromise = null;
 
 async function boot() {
-  await ensureRequireEsmSupport();
+  await ensureModuleRuntimeSupport();
   normalizeEnvironment();
-  const [
-    { loadConfig },
-    { openPostgresProductDatabase },
-    { openPostgresCollaborationDatabase },
-    { createWorkspaceApplication },
-  ] = await Promise.all([
-    import("../apps/workspace/dist/server/config.js"),
-    import("../apps/workspace/dist/server/db/postgres/open.js"),
-    import("../apps/workspace/dist/server/integrations/univer/collaboration-database/postgres/open.js"),
-    import("../apps/workspace/dist/server/app.js"),
-  ]);
+  const { loadConfig } = await import("../apps/workspace/dist/server/config.js");
+  const { openPostgresProductDatabase } = await import("../apps/workspace/dist/server/db/postgres/open.js");
+  const { openPostgresCollaborationDatabase } = await import(
+    "../apps/workspace/dist/server/integrations/univer/collaboration-database/postgres/open.js"
+  );
+  const { createWorkspaceApplication } = await import("../apps/workspace/dist/server/app.js");
 
   const config = loadConfig();
   if (config.database.provider !== "postgres" || !config.s3BlobStore) {
@@ -367,7 +464,8 @@ export default async function handler(req, res) {
     }
     return app(req, res);
   } catch (error) {
-    const summary = redactSecrets(error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}` : String(error));
+    const rawMsg = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}${extractNodeModulesSnippet(error.stack)}` : String(error);
+    const summary = redactSecrets(rawMsg);
     console.error("Workspace serverless boot failed:", summary);
     if (isDiagHealth) {
       res.statusCode = 200;
