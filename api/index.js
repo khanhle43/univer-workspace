@@ -14,7 +14,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const preloadedEsmByPath = new Map();
 const cjsExportsRegistry = (globalThis.__univerCjsExports ??= new Map());
 const cjsRequire = Module.createRequire(import.meta.url);
-const packageTypeCache = new Map();
 let moduleHooksInstalled = false;
 
 const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
@@ -36,50 +35,11 @@ function safeRealpath(p) {
   }
 }
 
-function isCommonJsFile(filename) {
-  if (filename.endsWith(".cjs")) return true;
-  if (!filename.endsWith(".js")) return false;
-  let dir = dirname(filename);
-  while (true) {
-    if (packageTypeCache.has(dir)) {
-      return packageTypeCache.get(dir) !== "module";
-    }
-    const pj = join(dir, "package.json");
-    if (existsSync(pj)) {
-      let pkgType = "commonjs";
-      try {
-        const data = JSON.parse(readFileSync(pj, "utf8"));
-        if (data.type === "module") pkgType = "module";
-      } catch {
-        pkgType = "commonjs";
-      }
-      packageTypeCache.set(dir, pkgType);
-      return pkgType !== "module";
-    }
-    const parent = dirname(dir);
-    if (parent === dir) return true;
-    dir = parent;
-  }
-}
-
 function lookupPreloadedEsm(filename) {
   if (preloadedEsmByPath.has(filename)) return preloadedEsmByPath.get(filename);
   const real = safeRealpath(filename);
   if (preloadedEsmByPath.has(real)) return preloadedEsmByPath.get(real);
   return undefined;
-}
-
-function compileModuleInstanceAsEsm(mod, filename) {
-  mod.filename = filename;
-  mod.paths = Module._nodeModulePaths(dirname(filename));
-  const preloaded = lookupPreloadedEsm(filename);
-  if (preloaded !== undefined) {
-    mod.exports = preloaded;
-  } else {
-    const source = readFileSync(filename, "utf8");
-    mod._compile(source, filename, "module");
-  }
-  mod.loaded = true;
 }
 
 function installModuleCompatibilityHooks() {
@@ -101,40 +61,7 @@ function installModuleCompatibilityHooks() {
         this.loaded = true;
         return;
       }
-      try {
-        return prevProtoLoad.call(this, filename);
-      } catch (err) {
-        if (err && err.code === "ERR_REQUIRE_ESM") {
-          compileModuleInstanceAsEsm(this, filename);
-          return;
-        }
-        throw err;
-      }
-    };
-  }
-
-  const prevStaticLoad = Module._load;
-  if (typeof prevStaticLoad === "function") {
-    Module._load = function patchedStaticLoad(request, parent, isMain) {
-      try {
-        return prevStaticLoad.call(this, request, parent, isMain);
-      } catch (err) {
-        if (err && err.code === "ERR_REQUIRE_ESM") {
-          const filename = Module._resolveFilename(request, parent, isMain);
-          const cached = Module._cache[filename];
-          if (cached && cached.loaded) return cached.exports;
-          const mod = cached || new Module(filename, parent);
-          Module._cache[filename] = mod;
-          try {
-            compileModuleInstanceAsEsm(mod, filename);
-            return mod.exports;
-          } catch (compileErr) {
-            delete Module._cache[filename];
-            throw compileErr;
-          }
-        }
-        throw err;
-      }
+      return prevProtoLoad.call(this, filename);
     };
   }
 
@@ -146,15 +73,7 @@ function installModuleCompatibilityHooks() {
         mod.exports = preloaded;
         return;
       }
-      try {
-        return prevJs.call(this, mod, filename);
-      } catch (err) {
-        if (err && err.code === "ERR_REQUIRE_ESM") {
-          compileModuleInstanceAsEsm(mod, filename);
-          return;
-        }
-        throw err;
-      }
+      return prevJs.call(this, mod, filename);
     };
   }
 
@@ -166,51 +85,53 @@ function installModuleCompatibilityHooks() {
       return;
     }
     if (typeof prevMjs === "function") {
-      try {
-        return prevMjs.call(this, mod, filename);
-      } catch (err) {
-        if (!err || err.code !== "ERR_REQUIRE_ESM") throw err;
-      }
+      return prevMjs.call(this, mod, filename);
     }
-    compileModuleInstanceAsEsm(mod, filename);
   };
 
   // 2. Vercel bytecode caching (VERCEL_USE_BYTECODE_CACHING) replaces CJS .js files
   //    on disk with bytecode stubs, so Node's static cjs-module-lexer sees zero named
-  //    exports when an .mjs wrapper imports a CJS package. Execute the CJS module via
-  //    require() and synthesize live ESM named exports from its runtime exports object.
+  //    exports when an ESM module imports a CJS package. Use nextLoad() so Node's own
+  //    parser distinguishes ESM (including typeless dual packages like @univerjs/protocol)
+  //    from CommonJS, and never intercept require() calls.
   if (typeof Module.registerHooks === "function") {
     Module.registerHooks({
       load(url, context, nextLoad) {
-        if (url.startsWith("file://")) {
+        if (Array.isArray(context?.conditions) && context.conditions.includes("require")) {
+          return nextLoad(url, context);
+        }
+        const loaded = nextLoad(url, context);
+        if (
+          loaded.format === "commonjs" &&
+          url.startsWith("file://") &&
+          url.includes("/node_modules/")
+        ) {
           const filename = fileURLToPath(url);
-          if (filename.includes("/node_modules/") && isCommonJsFile(filename)) {
-            const exp = cjsRequire(filename);
-            cjsExportsRegistry.set(url, exp);
-            const lines = [
-              `const __exp = globalThis.__univerCjsExports.get(${JSON.stringify(url)});`,
-              `export default __exp;`,
-            ];
-            if ((exp && typeof exp === "object") || typeof exp === "function") {
-              const isFn = typeof exp === "function";
-              const rawKeys = new Set([
-                ...Object.keys(exp),
-                ...Object.getOwnPropertyNames(exp).filter((k) => !isFn || !FUNCTION_INTRINSICS.has(k)),
-                ...(exp.default && typeof exp.default === "object" ? Object.keys(exp.default) : []),
-              ]);
-              for (const k of rawKeys) {
-                if (IDENT_RE.test(k) && !RESERVED_WORDS.has(k)) {
-                  const keyLit = JSON.stringify(k);
-                  lines.push(
-                    `export const ${k} = __exp[${keyLit}] !== undefined ? __exp[${keyLit}] : __exp?.default?.[${keyLit}];`,
-                  );
-                }
+          const exp = cjsRequire(filename);
+          cjsExportsRegistry.set(url, exp);
+          const lines = [
+            `const __exp = globalThis.__univerCjsExports.get(${JSON.stringify(url)});`,
+            `export default __exp;`,
+          ];
+          if ((exp && typeof exp === "object") || typeof exp === "function") {
+            const isFn = typeof exp === "function";
+            const rawKeys = new Set([
+              ...Object.keys(exp),
+              ...Object.getOwnPropertyNames(exp).filter((k) => !isFn || !FUNCTION_INTRINSICS.has(k)),
+              ...(exp.default && typeof exp.default === "object" ? Object.keys(exp.default) : []),
+            ]);
+            for (const k of rawKeys) {
+              if (IDENT_RE.test(k) && !RESERVED_WORDS.has(k)) {
+                const keyLit = JSON.stringify(k);
+                lines.push(
+                  `export const ${k} = __exp[${keyLit}] !== undefined ? __exp[${keyLit}] : __exp?.default?.[${keyLit}];`,
+                );
               }
             }
-            return { format: "module", shortCircuit: true, source: lines.join("\n") };
           }
+          return { format: "module", shortCircuit: true, source: lines.join("\n") };
         }
-        return nextLoad(url, context);
+        return loaded;
       },
     });
   }
