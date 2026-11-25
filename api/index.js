@@ -667,8 +667,6 @@ async function boot() {
 
 export default async function handler(req, res) {
   restoreRewrittenUrl(req);
-  const parsedUrl = new URL(req.url || "/", "http://localhost");
-  const isDiagHealth = parsedUrl.pathname === "/healthz" && parsedUrl.searchParams.get("diag") === "1";
 
   try {
     if (!appPromise) {
@@ -678,24 +676,12 @@ export default async function handler(req, res) {
       });
     }
     const app = await appPromise;
-    if (isDiagHealth) {
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "text/html; charset=utf-8");
-      res.end("<!doctype html><title>Univer Workspace Health</title><pre>STATUS: OK</pre>");
-      return;
-    }
     return app(req, res);
   } catch (error) {
+    // Diagnostics stay in the server log; they are never returned to clients.
     const diagBlock = `\n\n--- preloadDiag ---\n${JSON.stringify(preloadDiag, null, 2)}`;
     const rawMsg = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}${extractNodeModulesSnippet(error.stack)}${diagBlock}` : `${String(error)}${diagBlock}`;
-    const summary = redactSecrets(rawMsg);
-    console.error("Workspace serverless boot failed:", summary);
-    if (isDiagHealth) {
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "text/html; charset=utf-8");
-      res.end(`<!doctype html><title>Univer Workspace Boot Error</title><pre>${summary.replaceAll("&", "&amp;").replaceAll("<", "&lt;")}</pre>`);
-      return;
-    }
+    console.error("Workspace serverless boot failed:", redactSecrets(rawMsg));
     res.statusCode = 500;
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.end(JSON.stringify({ error: { code: "BOOT_FAILED", message: redactSecrets(error instanceof Error ? error.message : String(error)) } }));
