@@ -17,24 +17,24 @@ import {
   type UniverLicenseCredentials,
 } from "./univer-license.js";
 
-const moduleRequire = createRequire(import.meta.url);
-const { getBoardsEmptySnapshot } = moduleRequire(
+const require = createRequire(import.meta.url);
+const { getBoardsEmptySnapshot } = require(
   "@univerjs-pro/boards"
 ) as typeof BoardsModule;
-const { UniverCommentService } = moduleRequire(
+const { UniverCommentService } = require(
   "@univerjs-pro/collaboration-comment-service"
 ) as typeof CommentServiceModule;
-const { UniverHistoryService } = moduleRequire(
+const { UniverHistoryService } = require(
   "@univerjs-pro/collaboration-history-service"
 ) as typeof HistoryServiceModule;
 const {
   CollabError,
   UnitSnapshotMaterializer,
   UniverCollabService,
-} = moduleRequire(
+} = require(
   "@univerjs-pro/collaboration-service"
 ) as typeof CollaborationServiceModule;
-const { UniverCollabWorktreeService } = moduleRequire(
+const { UniverCollabWorktreeService } = require(
   "@univerjs-pro/collaboration-worktree-service"
 ) as typeof WorktreeServiceModule;
 
@@ -47,21 +47,26 @@ const { UniverCollabWorktreeService } = moduleRequire(
  * The trunk Service and the materializer each get half the available CPUs; the
  * materializer is created once and reused, never per request. Each Worktree has
  * its own Draft Service, usually a few Units edited by a few users, so it gets
- * one Worker.
+ * one Worker. On serverless (Vercel), run in-process to avoid multi-worker
+ * cold-start latency and memory overhead.
  */
-const UNIT_RUNTIME: CollaborationServiceModule.UnitRuntimeConfig = {
-  execution: {
-    mode: "worker",
-    workerCount: Math.max(1, Math.floor(availableParallelism() / 2)),
-  },
-};
-const WORKTREE_UNIT_RUNTIME: CollaborationServiceModule.UnitRuntimeConfig = {
-  execution: { mode: "worker", workerCount: 1 },
-};
-const { getSlidesEmptySnapshot } = moduleRequire(
+const IN_PROCESS_RUNTIME =
+  process.env.UNIT_RUNTIME_MODE === "in-process" || Boolean(process.env.VERCEL);
+const UNIT_RUNTIME: CollaborationServiceModule.UnitRuntimeConfig = IN_PROCESS_RUNTIME
+  ? { execution: { mode: "in-process" } }
+  : {
+      execution: {
+        mode: "worker",
+        workerCount: Math.max(1, Math.floor(availableParallelism() / 2)),
+      },
+    };
+const WORKTREE_UNIT_RUNTIME: CollaborationServiceModule.UnitRuntimeConfig = IN_PROCESS_RUNTIME
+  ? { execution: { mode: "in-process" } }
+  : { execution: { mode: "worker", workerCount: 1 } };
+const { getSlidesEmptySnapshot } = require(
   "@univerjs-pro/slides"
 ) as typeof SlidesModule;
-const { getPdfsEmptySnapshot } = moduleRequire(
+const { getPdfsEmptySnapshot } = require(
   "@univerjs-pro/pdfs"
 ) as typeof PdfsModule;
 const {
@@ -71,8 +76,8 @@ const {
   getSheetsEmptySnapshot,
   LocaleType,
   mergeWorksheetSnapshotWithDefault,
-} = moduleRequire("@univerjs/core") as typeof CoreModule;
-const { UniverType } = moduleRequire(
+} = require("@univerjs/core") as typeof CoreModule;
+const { UniverType } = require(
   "@univerjs/protocol"
 ) as typeof ProtocolModule;
 

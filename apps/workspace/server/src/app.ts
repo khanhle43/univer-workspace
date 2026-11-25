@@ -8,6 +8,7 @@ import { createStandaloneAppRouter } from "./modules/views/standalone-app.router
 import { existsSync } from "node:fs";
 import type { Server } from "node:http";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createContentPermissions } from "./integrations/univer/content-permissions.js";
 import { apiReference } from "@scalar/express-api-reference";
 import express from "express";
@@ -143,16 +144,18 @@ import {
   type ExchangeModule,
 } from "./modules/exchange/index.js";
 
+const PACKAGE_ROOT = fileURLToPath(new URL("../..", import.meta.url));
+
 // Resolve a deployment-relative path against the likely runtime working directories.
 // Vercel serverless functions may run with a working directory that differs from the
 // project root, so we probe a few candidate bases and return the first that exists.
 function resolveDeployPath(relativePath: string): string {
-  const bases = [process.cwd(), resolve(process.cwd(), "apps/workspace")];
+  const bases = [process.cwd(), resolve(process.cwd(), "apps/workspace"), PACKAGE_ROOT];
   for (const base of bases) {
     const candidate = resolve(base, relativePath);
     if (existsSync(candidate)) return candidate;
   }
-  return resolve(process.cwd(), relativePath);
+  return resolve(PACKAGE_ROOT, relativePath);
 }
 
 export interface WorkspaceApplication {
