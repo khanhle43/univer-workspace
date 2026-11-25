@@ -6,7 +6,7 @@
 // WebSocket sync is intentionally omitted; single-user editing and collaboration
 // changeset/snapshot HTTP endpoints work against Supabase Postgres + S3.
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import Module from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -27,6 +27,14 @@ const RESERVED_WORDS = new Set([
   "public", "await", "__esModule",
 ]);
 const FUNCTION_INTRINSICS = new Set(["length", "name", "prototype", "arguments", "caller"]);
+
+function safeRealpath(p) {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
 
 function isCommonJsFile(filename) {
   if (filename.endsWith(".cjs")) return true;
@@ -54,19 +62,22 @@ function isCommonJsFile(filename) {
   }
 }
 
+function lookupPreloadedEsm(filename) {
+  if (preloadedEsmByPath.has(filename)) return preloadedEsmByPath.get(filename);
+  const real = safeRealpath(filename);
+  if (preloadedEsmByPath.has(real)) return preloadedEsmByPath.get(real);
+  return undefined;
+}
+
 function compileModuleInstanceAsEsm(mod, filename) {
   mod.filename = filename;
   mod.paths = Module._nodeModulePaths(dirname(filename));
-  if (preloadedEsmByPath.has(filename)) {
-    mod.exports = preloadedEsmByPath.get(filename);
+  const preloaded = lookupPreloadedEsm(filename);
+  if (preloaded !== undefined) {
+    mod.exports = preloaded;
   } else {
     const source = readFileSync(filename, "utf8");
-    // Vercel's /opt/rust/bytecode.js wraps Module.prototype._compile and drops the
-    // 3rd `format` argument when `filename` ends with ".js". Passing `${filename}.mjs`
-    // keeps the exact directory for relative imports while preserving format="module".
-    const compileFilename = filename.endsWith(".js") ? `${filename}.mjs` : filename;
-    mod._compile(source, compileFilename, "module");
-    mod.filename = filename;
+    mod._compile(source, filename, "module");
   }
   mod.loaded = true;
 }
@@ -76,11 +87,20 @@ function installModuleCompatibilityHooks() {
   moduleHooksInstalled = true;
 
   // 1. Vercel's Rust Node launcher (/opt/rust/nodejs.js) overrides Module.prototype.load
-  //    and throws ERR_REQUIRE_ESM before reaching Module._extensions[".js"], even on
-  //    Node 24/26 where native require(esm) is built into Module.prototype._compile.
+  //    and throws ERR_REQUIRE_ESM before reaching Module._extensions[".js"], and
+  //    /opt/rust/bytecode.js strips the 3rd `format` argument of Module.prototype._compile.
+  //    Serve preloaded ESM namespaces synchronously from preloadedEsmByPath.
   const prevProtoLoad = Module.prototype.load;
   if (typeof prevProtoLoad === "function") {
     Module.prototype.load = function patchedProtoLoad(filename) {
+      const preloaded = lookupPreloadedEsm(filename);
+      if (preloaded !== undefined) {
+        this.filename = filename;
+        this.paths = Module._nodeModulePaths(dirname(filename));
+        this.exports = preloaded;
+        this.loaded = true;
+        return;
+      }
       try {
         return prevProtoLoad.call(this, filename);
       } catch (err) {
@@ -121,6 +141,11 @@ function installModuleCompatibilityHooks() {
   const prevJs = Module._extensions[".js"];
   if (typeof prevJs === "function") {
     Module._extensions[".js"] = function patchedJsExtension(mod, filename) {
+      const preloaded = lookupPreloadedEsm(filename);
+      if (preloaded !== undefined) {
+        mod.exports = preloaded;
+        return;
+      }
       try {
         return prevJs.call(this, mod, filename);
       } catch (err) {
@@ -135,6 +160,11 @@ function installModuleCompatibilityHooks() {
 
   const prevMjs = Module._extensions[".mjs"];
   Module._extensions[".mjs"] = function patchedMjsExtension(mod, filename) {
+    const preloaded = lookupPreloadedEsm(filename);
+    if (preloaded !== undefined) {
+      mod.exports = preloaded;
+      return;
+    }
     if (typeof prevMjs === "function") {
       try {
         return prevMjs.call(this, mod, filename);
@@ -186,23 +216,73 @@ function installModuleCompatibilityHooks() {
   }
 }
 
-function supportsSyncCompileModuleInTask() {
-  try {
-    const probeFile = resolve(process.cwd(), "__esm_probe.js.mjs");
-    const probe = new Module(probeFile);
-    probe.filename = probeFile;
-    probe._compile("export const ok = 1;", probeFile, "module");
-    return probe.exports?.ok === 1;
-  } catch {
-    return false;
+function toCjsCompatibleEsmExports(ns) {
+  // Match Node's native require(esm) behavior: attach __esModule: true iff default export exists.
+  if (!ns || typeof ns !== "object") return ns;
+  if (!("default" in ns)) return ns;
+  if (ns.__esModule === true) return ns;
+  const out = Object.create(null);
+  Object.defineProperty(out, "__esModule", {
+    value: true,
+    writable: true,
+    enumerable: true,
+    configurable: false,
+  });
+  for (const key of Reflect.ownKeys(ns)) {
+    if (key === "__esModule") continue;
+    const desc = Object.getOwnPropertyDescriptor(ns, key);
+    if (desc) Object.defineProperty(out, key, desc);
   }
+  return out;
+}
+
+function registerPreloadedEsm(filePath, ns) {
+  const wrapped = toCjsCompatibleEsmExports(ns);
+  preloadedEsmByPath.set(filePath, wrapped);
+  preloadedEsmByPath.set(safeRealpath(filePath), wrapped);
+}
+
+function collectPackageExportSpecifiers(pj, pkgDir) {
+  const specs = new Set();
+  const name = typeof pj.name === "string" ? pj.name : null;
+  if (name) {
+    if (typeof pj.exports === "string") {
+      specs.add(name);
+    } else if (pj.exports && typeof pj.exports === "object" && !Array.isArray(pj.exports)) {
+      const keys = Object.keys(pj.exports);
+      const hasSubpaths = keys.some((k) => k.startsWith("."));
+      if (hasSubpaths) {
+        for (const k of keys) {
+          if (k === "./package.json" || k.includes("*")) continue;
+          if (k === ".") {
+            specs.add(name);
+          } else if (k.startsWith("./")) {
+            const sub = k.slice(2);
+            specs.add(`${name}/${sub}`);
+          }
+        }
+      } else {
+        specs.add(name);
+      }
+    } else {
+      specs.add(name);
+    }
+  }
+  specs.add(pkgDir);
+  return [...specs];
 }
 
 async function preloadPnpmEsmPackages() {
-  const pnpmRoot = resolve(process.cwd(), "node_modules/.pnpm");
-  if (!existsSync(pnpmRoot)) return;
+  const apiDir = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    "/var/task/node_modules/.pnpm",
+    resolve(process.cwd(), "node_modules/.pnpm"),
+    resolve(apiDir, "../node_modules/.pnpm"),
+  ];
+  const pnpmRoot = candidates.find((p) => existsSync(p));
+  if (!pnpmRoot) return;
 
-  const pkgDirs = [];
+  const pkgEntries = [];
   for (const storeEntry of readdirSync(pnpmRoot, { withFileTypes: true })) {
     if (!storeEntry.isDirectory()) continue;
     const nmDir = join(pnpmRoot, storeEntry.name, "node_modules");
@@ -213,17 +293,15 @@ async function preloadPnpmEsmPackages() {
         const scopeDir = join(nmDir, entry.name);
         if (!existsSync(scopeDir)) continue;
         for (const sub of readdirSync(scopeDir, { withFileTypes: true })) {
-          pkgDirs.push(join(scopeDir, sub.name));
+          pkgEntries.push({ nmDir, pkgDir: join(scopeDir, sub.name) });
         }
       } else {
-        pkgDirs.push(join(nmDir, entry.name));
+        pkgEntries.push({ nmDir, pkgDir: join(nmDir, entry.name) });
       }
     }
   }
 
-  const preloadAllSubfiles = !supportsSyncCompileModuleInTask();
-
-  for (const pkgDir of pkgDirs) {
+  for (const { nmDir, pkgDir } of pkgEntries) {
     const pjPath = join(pkgDir, "package.json");
     if (!existsSync(pjPath)) continue;
     let pj;
@@ -233,31 +311,33 @@ async function preloadPnpmEsmPackages() {
       continue;
     }
     if (pj.type !== "module") continue;
-
-    // Skip CLI/dev-only ESM packages if any were traced
     if (typeof pj.name === "string" && (pj.name.startsWith("@babel/") || pj.name === "vite")) continue;
 
-    try {
-      const dummyParent = new Module(join(pkgDir, "__resolver__.cjs"));
-      dummyParent.filename = dummyParent.id;
-      dummyParent.paths = Module._nodeModulePaths(dirname(dummyParent.id));
-      const entryFile = Module._resolveFilename(pkgDir, dummyParent, false);
-      if (!preloadedEsmByPath.has(entryFile)) {
-        const ns = await import(pathToFileURL(entryFile).href);
-        preloadedEsmByPath.set(entryFile, toCjsCompatibleEsmExports(ns));
+    const dummyParent = new Module(join(nmDir, "__resolver__.cjs"));
+    dummyParent.filename = dummyParent.id;
+    dummyParent.paths = [nmDir, ...Module._nodeModulePaths(nmDir)];
+
+    for (const spec of collectPackageExportSpecifiers(pj, pkgDir)) {
+      try {
+        const entryFile = Module._resolveFilename(spec, dummyParent, false);
+        if (!isCommonJsFile(entryFile) && lookupPreloadedEsm(entryFile) === undefined) {
+          const ns = await import(pathToFileURL(entryFile).href);
+          registerPreloadedEsm(entryFile, ns);
+        }
+      } catch {
+        // Ignore subpaths without CJS/default resolution or browser-only modules.
       }
-    } catch {
-      // Ignore packages without a root export or browser-only side-effect modules.
     }
 
-    if (preloadAllSubfiles && (pj.name === "lodash-es" || pj.name?.startsWith("@noble/"))) {
+    // Also preload flat .js modules for subpath-imported ESM packages (e.g. lodash-es/debounce.js).
+    if (!pj.exports || pj.name === "lodash-es" || pj.name?.startsWith("@noble/")) {
       try {
         for (const file of readdirSync(pkgDir, { withFileTypes: true })) {
           if (!file.isFile() || !file.name.endsWith(".js")) continue;
           const full = join(pkgDir, file.name);
-          if (!preloadedEsmByPath.has(full)) {
+          if (lookupPreloadedEsm(full) === undefined) {
             const ns = await import(pathToFileURL(full).href);
-            preloadedEsmByPath.set(full, toCjsCompatibleEsmExports(ns));
+            registerPreloadedEsm(full, ns);
           }
         }
       } catch {
@@ -265,18 +345,6 @@ async function preloadPnpmEsmPackages() {
       }
     }
   }
-}
-
-function toCjsCompatibleEsmExports(ns) {
-  // Match Node's native require(esm) Module Namespace shape (__esModule: true + all named/default exports).
-  if (!ns || typeof ns !== "object") return ns;
-  const out = Object.create(null);
-  Object.defineProperty(out, "__esModule", { value: true, enumerable: false });
-  for (const key of Reflect.ownKeys(ns)) {
-    const desc = Object.getOwnPropertyDescriptor(ns, key);
-    if (desc) Object.defineProperty(out, key, desc);
-  }
-  return out;
 }
 
 async function ensureModuleRuntimeSupport() {
