@@ -63,6 +63,7 @@ import { syncUniverTheme, useTheme } from "../../shared/theme";
 import { Alert } from "../../shared/ui/alert";
 import { Spinner } from "../../shared/ui/spinner";
 import { cn } from "../../shared/utils/cn";
+import { wsOrigin } from "../../shared/ws-host";
 import {
   collaborationStatusMessageKey,
   type CollaborationIssue,
@@ -777,14 +778,13 @@ export async function resolveCollaborationConfig(
   readonly pluginConfig: Partial<IUniverCollaborationClientConfig>;
   readonly hostSnapshotScope: WorkspaceHostSnapshotScope;
 }> {
-  const wsProtocol =
-    window.location.protocol === "https:" ? "wss:" : "ws:";
+  const wsHost = wsOrigin();
   if (scope.kind === "trunk") {
     return {
       pluginConfig: {
         snapshotServerUrl: "/universer-api/snapshot",
         collabSubmitChangesetUrl: "/universer-api/comb",
-        collabWebSocketUrl: `${wsProtocol}//${window.location.host}/universer-api/comb/connect`,
+        collabWebSocketUrl: `${wsHost}/universer-api/comb/connect`,
         uploadFileServerUrl: "/universer-api/stream/file/upload",
         signUrlServerUrl: "/universer-api/file/{fileID}/sign-url",
       },
@@ -798,6 +798,7 @@ export async function resolveCollaborationConfig(
           origin: window.location.origin,
           worktreeID: scope.worktreeId,
         }),
+        collabWebSocketUrl: `${wsHost}/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/comb/connect`,
         authzUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/authz`,
         uploadFileServerUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/stream/file/upload`,
         signUrlServerUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/file/{fileID}/sign-url`,
@@ -817,6 +818,7 @@ export async function resolveCollaborationConfig(
       origin: window.location.origin,
       worktreeID: scope.worktreeId,
     }),
+    collabWebSocketUrl: `${wsHost}/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/comb/connect`,
     authzUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/authz`,
     uploadFileServerUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/stream/file/upload`,
     signUrlServerUrl: `/universer-api/worktrees/${encodeURIComponent(scope.worktreeId)}/file/{fileID}/sign-url`,

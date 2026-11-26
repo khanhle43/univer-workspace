@@ -957,3 +957,16 @@ CREATE TABLE executor_access (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   granted_at BIGINT NOT NULL
 );
+
+-- One-time session tickets for the collaboration WebSocket handshake.
+-- Issued on GET /universer-api/user/session-ticket (HTTP) and consumed on the
+-- WebSocket upgrade (DELETE ... RETURNING). Shared between the HTTP front and
+-- the long-lived realtime server so tickets cross process boundaries.
+CREATE TABLE session_tickets (
+  ticket TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  custom_data TEXT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX session_tickets_expiry ON session_tickets(expires_at);

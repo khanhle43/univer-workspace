@@ -175,6 +175,7 @@ SECURE_COOKIES=true
 | `UNIVER_LICENSE`, `UNIVER_LICENSE_KEY` | Bundled development pair | Set both on the running server to license collaboration and Office import/export. |
 | `VITE_UNIVER_LICENSE` | Bundled browser development license | Set at **build time** for a deployment domain outside the bundled license. The Docker build accepts this name as a build argument. An unlicensed browser host receives HTTP 403 (code 9018) from collaboration. |
 | `VITE_UNIVER_WORKSPACE_HARNESS_ORIGIN` | Unset on deployed hosts | Set the Agent application URL at Vite build time. On `localhost` or `127.0.0.1` with port 4020 or the protocol's default port, the browser defaults to the same host on port 3081. |
+| `VITE_WS_HOST` | Unset (same as page origin) | Set at **build time** to the WebSocket host when realtime runs on a separate long-lived server (Docker/VM) while HTTP is served by a serverless front such as Vercel. Accepts a bare host (`ws.example.com`) or a full URL (`wss://ws.example.com`). Unset: WebSockets connect to the current page origin. |
 | `WORKSPACE_DEV_API_PORT`, `WORKSPACE_DEV_MCP_PORT` | `3020`, `3000` | Set in the Vite process environment when the local API or MCP gateway uses another port. |
 
 For example, to move the local API to port 4020, run these commands in separate terminals from the repository root.

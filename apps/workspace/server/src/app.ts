@@ -201,6 +201,13 @@ export function createWorkspaceApplication(
     readonly emailSender?: EmailSender;
     readonly oauthStateSecret?: string;
     readonly fetchClientMetadataDocument?: FetchClientMetadataDocument;
+    /**
+     * Shared session ticket store for the collaboration WebSocket handshake. When
+     * the HTTP session-ticket route and the WebSocket upgrade run in different
+     * processes, supply a Postgres-backed store. An injected store remains owned
+     * by the caller and is not disposed by the application.
+     */
+    readonly ticketStore?: import("@univerjs-pro/collaboration-endpoint").ISessionTicketStore;
   } = {},
 ): WorkspaceApplication {
   const oauthStateSecret =
@@ -421,6 +428,7 @@ export function createWorkspaceApplication(
         worktrees,
         worktreeChangeFeed,
         sessionSockets,
+        ticketStore: dependencies.ticketStore,
       })
     : null;
   invalidateRealtimeNodeAccess = () =>

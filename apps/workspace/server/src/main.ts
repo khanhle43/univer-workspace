@@ -5,6 +5,7 @@ import { openProductDatabase, type ProductDatabase } from "./db/index.js";
 import { startOperationRecovery, type OperationRecovery } from "./jobs/operation-recovery.js";
 import { startBlobMaintenance } from "./jobs/blob-maintenance.js";
 import { startIssueAcceptance } from "./jobs/issue-acceptance.js";
+import { PostgresSessionTicketStore } from "./integrations/realtime/postgres-session-ticket-store.js";
 import { shutdownServer } from "./server-lifecycle.js";
 import { logger } from "./logging/logger.js";
 import { beginStartupStage, startupStage, startupStageAsync } from "./logging/startup.js";
@@ -41,52 +42,69 @@ try {
 }
 
 async function serve(product: ProductDatabase, collaboration: CollaborationDatabase): Promise<void> {
-  const application = startupStage("application.create", () =>
-    createWorkspaceApplication(config, product.repositories, collaboration),
-  );
-  const server = createServer(application.app);
-  const jobs: OperationRecovery[] = [];
+  // Shared session ticket store so tickets issued on the HTTP session-ticket route
+  // are consumable on the WebSocket upgrade. Uses Postgres so the store is shared
+  // across processes (HTTP front vs. long-lived realtime server).
+  const ticketStore =
+    config.database.provider === "postgres"
+      ? new PostgresSessionTicketStore(config.database.connectionString)
+      : undefined;
   try {
-    await startupStageAsync("application.initialize", () => application.initialize());
-    jobs.push(startOperationRecovery(application.resources));
-    jobs.push(startOperationRecovery(application.copies));
-    jobs.push(startOperationRecovery(application.reverts));
-    jobs.push(startBlobMaintenance(application.blobs, {
-      drafts: application.htmlViewDrafts,
-      skillDrafts: application.skillDrafts,
-      univerAssets: application.univerAssets,
-    }));
-    jobs.push(startIssueAcceptance(application.issues));
-    application.attachWebSocket(server);
-
-    const logListen = beginStartupStage("server.listen");
-    const stop = new AbortController();
-    const onSignal = () => stop.abort();
-    process.once("SIGINT", onSignal);
-    process.once("SIGTERM", onSignal);
+    const application = startupStage("application.create", () =>
+      createWorkspaceApplication(config, product.repositories, collaboration, {
+        ...(ticketStore ? { ticketStore } : {}),
+      }),
+    );
+    const server = createServer(application.app);
+    const jobs: OperationRecovery[] = [];
     try {
-      await new Promise<void>((resolve, reject) => {
-        stop.signal.addEventListener("abort", () => {
-          if (server.listening) resolve();
-        }, { once: true });
-        server.once("error", reject);
-        server.listen(config.port, config.host, () => {
-          logListen("completed");
-          logger.info({ host: config.host, port: config.port }, "Univer Workspace is running");
-          // A signal during hostname resolution must still drain the newly opened listener.
-          if (stop.signal.aborted) resolve();
+      await startupStageAsync("application.initialize", () => application.initialize());
+      jobs.push(startOperationRecovery(application.resources));
+      jobs.push(startOperationRecovery(application.copies));
+      jobs.push(startOperationRecovery(application.reverts));
+      jobs.push(startBlobMaintenance(application.blobs, {
+        drafts: application.htmlViewDrafts,
+        skillDrafts: application.skillDrafts,
+        univerAssets: application.univerAssets,
+      }));
+      jobs.push(startIssueAcceptance(application.issues));
+      application.attachWebSocket(server);
+
+      const logListen = beginStartupStage("server.listen");
+      const stop = new AbortController();
+      const onSignal = () => stop.abort();
+      process.once("SIGINT", onSignal);
+      process.once("SIGTERM", onSignal);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          stop.signal.addEventListener("abort", () => {
+            if (server.listening) resolve();
+          }, { once: true });
+          server.once("error", reject);
+          server.listen(config.port, config.host, () => {
+            logListen("completed");
+            logger.info({ host: config.host, port: config.port }, "Univer Workspace is running");
+            ticketStore?.startSweeper();
+            // A signal during hostname resolution must still drain the newly opened listener.
+            if (stop.signal.aborted) resolve();
+          });
         });
-      });
-    } catch (error) {
-      if (!server.listening) logListen("failed", error);
-      throw error;
+      } catch (error) {
+        if (!server.listening) logListen("failed", error);
+        throw error;
+      } finally {
+        process.off("SIGINT", onSignal);
+        process.off("SIGTERM", onSignal);
+      }
     } finally {
-      process.off("SIGINT", onSignal);
-      process.off("SIGTERM", onSignal);
+      await shutdownServer(server, {
+        async dispose() {
+          await Promise.all(jobs.map((job) => job.dispose()));
+          await ticketStore?.dispose();
+        },
+      }, application);
     }
   } finally {
-    await shutdownServer(server, {
-      async dispose() { await Promise.all(jobs.map((job) => job.dispose())); },
-    }, application);
+    await ticketStore?.dispose();
   }
 }

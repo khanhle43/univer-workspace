@@ -643,6 +643,7 @@ async function boot() {
     "../apps/workspace/dist/server/integrations/univer/collaboration-database/postgres/open.js"
   );
   const { createWorkspaceApplication } = await import("../apps/workspace/dist/server/app.js");
+  const { PostgresSessionTicketStore } = await import("../apps/workspace/dist/server/integrations/realtime/postgres-session-ticket-store.js");
 
   const config = loadConfig();
   if (config.database.provider !== "postgres" || !config.s3BlobStore) {
@@ -653,12 +654,20 @@ async function boot() {
     config.database.connectionString,
   );
   let collaboration;
+  let ticketStore;
   try {
     collaboration = await openPostgresCollaborationDatabase(connectionString, config.s3BlobStore);
-    const application = createWorkspaceApplication(config, database.repositories, collaboration);
+    // Shared Postgres ticket store: Vercel mints session tickets on the HTTP
+    // route and the long-lived realtime server consumes them on the WebSocket
+    // upgrade. An in-memory store cannot cross process boundaries.
+    ticketStore = new PostgresSessionTicketStore(connectionString, 1);
+    const application = createWorkspaceApplication(config, database.repositories, collaboration, {
+      ticketStore,
+    });
     await application.initialize();
     return application.app;
   } catch (error) {
+    await ticketStore?.dispose().catch(() => undefined);
     await collaboration?.close().catch(() => undefined);
     await database.close().catch(() => undefined);
     throw error;
