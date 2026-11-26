@@ -4,6 +4,7 @@ import type { Server } from "node:http";
 import {
   MemorySessionTicketStore,
   UniverCollabEndpoint,
+  type ISessionTicketStore,
 } from "@univerjs-pro/collaboration-endpoint";
 import { UniverCommentEndpoint } from "@univerjs-pro/collaboration-comment-endpoint";
 import { UniverHistoryEndpoint } from "@univerjs-pro/collaboration-history-endpoint";
@@ -98,6 +99,13 @@ export function createCollaborationGateway(options: {
   readonly worktrees: WorktreesModule;
   readonly worktreeChangeFeed: WorktreeChangeFeed;
   readonly sessionSockets: SessionSockets;
+  /**
+   * Shared session ticket store. When the HTTP session-ticket route and the
+   * WebSocket upgrade run in different processes, supply a Postgres-backed store
+   * so tickets issued on one are consumable on the other. An injected store
+   * remains owned by the caller.
+   */
+  readonly ticketStore?: ISessionTicketStore;
 }): CollaborationGateway {
   const {
     contentPermissions,
@@ -110,7 +118,7 @@ export function createCollaborationGateway(options: {
     worktrees,
     worktreeChangeFeed,
   } = options;
-  const ticketStore = new MemorySessionTicketStore();
+  const ticketStore = options.ticketStore ?? new MemorySessionTicketStore();
   const endpoint = new UniverCollabEndpoint(service, { ticketStore });
   const commentEndpoint = new UniverCommentEndpoint({
     service: commentService,

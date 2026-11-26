@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { invalidateProductLists } from "../nodes/nodes.commands";
 import { issuesQueryKey } from "../issues/issues.queries";
 import { activityQueryKey, worktreesQueryKey } from "./worktrees.queries";
+import { wsOrigin } from "../../shared/ws-host";
 
 const RECONNECT_DELAY_MS = 1_000;
 
@@ -40,9 +41,8 @@ export function useWorktreeChangeFeed(enabled: boolean): void {
           return;
         }
         if (disposed) return;
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         socket = new WebSocket(
-          `${protocol}//${window.location.host}/api/worktree-events?sessionTicket=${encodeURIComponent(body.ticket)}`
+          `${wsOrigin()}/api/worktree-events?sessionTicket=${encodeURIComponent(body.ticket)}`
         );
         socket.addEventListener("message", (event) => {
           const message = parseWorktreeChangeFeedMessage(event.data);

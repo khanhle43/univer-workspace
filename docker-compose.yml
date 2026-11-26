@@ -1,0 +1,62 @@
+# Long-lived realtime WebSocket server for Univer Workspace.
+#
+# Vercel (serverless) serves the static frontend and HTTP API, but cannot hold
+# WebSocket connections. This container runs the full Express + WebSocket server
+# (`dist/server/main.js`) as a persistent process, handling collaboration and
+# worktree realtime upgrades at:
+#   /universer-api/comb/connect
+#   /universer-api/worktrees/*/connect
+#   /api/worktree-events
+#
+# Tickets are minted by Vercel on GET /universer-api/user/session-ticket and
+# stored in Postgres (session_tickets table); this server consumes them on the
+# WebSocket upgrade through the shared Postgres ticket store.
+#
+# Required environment (same Supabase project as the Vercel deployment):
+#   DATABASE_URL     Supabase Postgres connection (IPv4 Session Pooler recommended)
+#   S3 bucket/region/credentials for blob storage
+# Set VITE_WS_HOST on the Vercel build to this service's public URL so the
+# browser opens WebSockets here instead of at the Vercel origin.
+
+services:
+  realtime:
+    build:
+      context: ./apps/workspace
+      dockerfile: Dockerfile
+    image: univer-workspace-realtime:latest
+    container_name: univer-workspace-realtime
+    restart: unless-stopped
+    ports:
+      - "3020:3020"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3020"
+      NODE_ENV: production
+      DATABASE_PROVIDER: postgres
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL to the Supabase Postgres connection string}
+      BLOB_STORE: s3
+      BLOB_S3_BUCKET: ${BLOB_S3_BUCKET:?Set BLOB_S3_BUCKET}
+      BLOB_S3_REGION: ${BLOB_S3_REGION:-}
+      BLOB_S3_PREFIX: ${BLOB_S3_PREFIX:-workspace}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_REGION: ${BLOB_S3_REGION:-}
+      BLOB_S3_FORCE_PATH_STYLE: "true"
+      SECURE_COOKIES: "true"
+      TRUST_PROXY: "1"
+      PASSWORD_AUTH_ENABLED: "true"
+      PG_POOL_MAX: "10"
+      LOG_LEVEL: info
+      # PUBLIC_ORIGIN should be the externally reachable origin of this container
+      # (used for OAuth issuer and absolute URLs in responses).
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-}
+      # Univer license keys, if licensed (optional; falls back to free tier).
+      UNIVER_LICENSE: ${UNIVER_LICENSE:-}
+      UNIVER_LICENSE_KEY: ${UNIVER_LICENSE_KEY:-}
+      # OAuth/email config from the shared .env, if used.
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}

@@ -24,7 +24,7 @@ export async function productSchemaFingerprint(client: PoolClient): Promise<stri
 }
 
 // UPGRADES[n - 1] takes schema version n to n + 1 and must leave the structure schema.sql creates.
-const UPGRADES: readonly ((client: PoolClient) => Promise<void>)[] = [repairDisplayNames, createExecutorAccess, addCopySource, repairDisplayNames, addDraftSourceWorktree, addDraftRevisions, addForks, addProposals, addIssueLink, addIssueVerdicts, addWorktreeChecks, addLanding, addRevertOperation];
+const UPGRADES: readonly ((client: PoolClient) => Promise<void>)[] = [repairDisplayNames, createExecutorAccess, addCopySource, repairDisplayNames, addDraftSourceWorktree, addDraftRevisions, addForks, addProposals, addIssueLink, addIssueVerdicts, addWorktreeChecks, addLanding, addRevertOperation, addSessionTickets];
 const VERSION = UPGRADES.length + 1;
 
 // Scope, failure semantics and exit condition: see planDisplayNameRepair in db/display-name-repair.ts.
@@ -166,6 +166,19 @@ ALTER TABLE operations ADD CONSTRAINT operations_kind_check CHECK (
     'revert_worktrees'
   )
 );`);
+}
+
+// Shared session tickets for the collaboration WebSocket handshake, issued on the
+// HTTP session-ticket route and consumed (DELETE ... RETURNING) on the WS upgrade.
+async function addSessionTickets(client: PoolClient): Promise<void> {
+  await client.query(`CREATE TABLE session_tickets (
+  ticket TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  custom_data TEXT NOT NULL,
+  expires_at BIGINT NOT NULL,
+  created_at BIGINT NOT NULL
+);
+CREATE INDEX session_tickets_expiry ON session_tickets(expires_at)`);
 }
 
 export async function initializePostgresSchema(pool: Pool): Promise<void> {
