@@ -21,8 +21,8 @@
 services:
   realtime:
     build:
-      context: ./apps/workspace
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: apps/workspace/Dockerfile
     image: univer-workspace-realtime:latest
     container_name: univer-workspace-realtime
     restart: unless-stopped
